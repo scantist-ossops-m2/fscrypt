@@ -24,9 +24,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"golang.org/x/sys/unix"
 
 	"github.com/google/fscrypt/crypto"
 	"github.com/google/fscrypt/metadata"
@@ -56,6 +58,19 @@ func getFakeProtector() *metadata.ProtectorData {
 		Source:              metadata.SourceType_raw_key,
 		WrappedKey:          wrappedProtectorKey,
 	}
+}
+
+func getFakeLoginProtector(uid int64) *metadata.ProtectorData {
+	protector := getFakeProtector()
+	protector.Source = metadata.SourceType_pam_passphrase
+	protector.Uid = uid
+	protector.Costs = &metadata.HashingCosts{
+		Time:        1,
+		Memory:      1 << 8,
+		Parallelism: 1,
+	}
+	protector.Salt = make([]byte, 16)
+	return protector
 }
 
 func getFakePolicy() *metadata.PolicyData {
@@ -313,6 +328,50 @@ func TestSetProtector(t *testing.T) {
 	}
 }
 
+// Tests that a login protector whose embedded UID doesn't match the file owner
+// is considered invalid.  (Such a file could be created by a malicious user to
+// try to confuse fscrypt into processing the wrong file.)
+func TestSpoofedLoginProtector(t *testing.T) {
+	myUID := int64(os.Geteuid())
+	badUID := myUID + 1 // anything different from myUID
+	mnt, err := getSetupMount(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mnt.RemoveAllMetadata()
+
+	// Control case: protector with matching UID should be accepted.
+	protector := getFakeLoginProtector(myUID)
+	if err = mnt.AddProtector(protector); err != nil {
+		t.Fatal(err)
+	}
+	_, err = mnt.GetRegularProtector(protector.ProtectorDescriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = mnt.RemoveProtector(protector.ProtectorDescriptor); err != nil {
+		t.Fatal(err)
+	}
+
+	// The real test: protector with mismatching UID should rejected,
+	// *unless* the process running the tests (and hence the file owner) is
+	// root in which case it should be accepted.
+	protector = getFakeLoginProtector(badUID)
+	if err = mnt.AddProtector(protector); err != nil {
+		t.Fatal(err)
+	}
+	_, err = mnt.GetRegularProtector(protector.ProtectorDescriptor)
+	if myUID == 0 {
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if err == nil {
+			t.Fatal("reading protector with bad UID unexpectedly succeeded")
+		}
+	}
+}
+
 // Gets a setup mount and a fake second mount
 func getTwoSetupMounts(t *testing.T) (realMnt, fakeMnt *Mount, err error) {
 	if realMnt, err = getSetupMount(t); err != nil {
@@ -380,5 +439,70 @@ func TestLinkedProtector(t *testing.T) {
 
 	if !proto.Equal(retProtector, protector) {
 		t.Errorf("protector %+v does not equal expected protector %+v", retProtector, protector)
+	}
+}
+
+func createFile(path string, size int64) error {
+	if err := ioutil.WriteFile(path, []byte{}, 0600); err != nil {
+		return err
+	}
+	return os.Truncate(path, size)
+}
+
+// Tests the readMetadataFileSafe() function.
+func TestReadMetadataFileSafe(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "fscrypt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(tempDir, "file")
+	defer os.RemoveAll(tempDir)
+
+	// Good file (control case)
+	if err = createFile(filePath, 1000); err != nil {
+		t.Fatal(err)
+	}
+	_, owner, err := readMetadataFileSafe(filePath)
+	if err != nil {
+		t.Fatal("failed to read file")
+	}
+	if owner != int64(os.Geteuid()) {
+		t.Fatal("got wrong owner")
+	}
+	os.Remove(filePath)
+
+	// Nonexistent file
+	_, _, err = readMetadataFileSafe(filePath)
+	if !os.IsNotExist(err) {
+		t.Fatal("trying to read nonexistent file didn't fail with expected error")
+	}
+
+	// Symlink
+	if err = os.Symlink("target", filePath); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = readMetadataFileSafe(filePath)
+	if err.(*os.PathError).Err != syscall.ELOOP {
+		t.Fatal("trying to read symlink didn't fail with ELOOP")
+	}
+	os.Remove(filePath)
+
+	// FIFO
+	if err = unix.Mkfifo(filePath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = readMetadataFileSafe(filePath)
+	if _, ok := err.(*ErrCorruptMetadata); !ok {
+		t.Fatal("trying to read FIFO didn't fail with expected error")
+	}
+	os.Remove(filePath)
+
+	// Very large file
+	if err = createFile(filePath, 1000000); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = readMetadataFileSafe(filePath)
+	if _, ok := err.(*ErrCorruptMetadata); !ok {
+		t.Fatal("trying to read very large file didn't fail with expected error")
 	}
 }
